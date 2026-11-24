@@ -218,3 +218,58 @@ def test_progress_summary_fallback(monkeypatch):
         assert len(data["focus_areas_es"]) >= 1
         assert 40 <= data["fluency_score"] <= 100
         assert data["xp_bonus"] >= 10
+
+
+def test_call_ai_404_auto_fallback_and_reasoning_strip(monkeypatch):
+    import asyncio
+    import httpx
+
+    monkeypatch.setattr(main, "AI_API_KEY", "test-key")
+    monkeypatch.setattr(main, "AI_MODEL", "retired-model-id")
+    monkeypatch.setattr(main, "_resolved_ai_model", None)
+
+    seen_models = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/chat/completions"):
+            import json
+            payload = json.loads(request.content.decode("utf-8"))
+            seen_models.append(payload["model"])
+            if payload["model"] == "retired-model-id":
+                return httpx.Response(404, json={"error": {"message": "Model retired-model-id does not exist"}})
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '<think>internal draft</think>\n{"reply": "Hi! How is your day?", "translation_es": "¡Hola! ¿Cómo va tu día?"}'
+                            }
+                        }
+                    ]
+                },
+            )
+        if request.url.path.endswith("/models"):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"id": "whisper-large-v3", "active": True},
+                        {"id": "openai/gpt-oss-20b", "active": True},
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    async def run():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await main.call_ai(client, "sys", [{"role": "user", "content": "hi"}])
+
+    raw = asyncio.run(run())
+    assert seen_models == ["retired-model-id", "openai/gpt-oss-20b"]
+    assert main._resolved_ai_model == "openai/gpt-oss-20b"
+    assert "<think>" not in raw
+    parsed = main.parse_output(raw, level="NOVATO", user_text="hi")
+    assert parsed["reply"] == "Hi! How is your day?"
+    assert parsed["translation_es"] == "¡Hola! ¿Cómo va tu día?"

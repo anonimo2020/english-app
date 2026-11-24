@@ -46,13 +46,33 @@ _load_dotenv()
 # --- Configuración (variables de entorno) ----------------------------------
 AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
 AI_API_KEY = os.getenv("AI_API_KEY", "")
-AI_MODEL = os.getenv("AI_MODEL", "llama-3.3-70b-versatile")
+AI_MODEL = os.getenv("AI_MODEL", "openai/gpt-oss-120b")
 APP_TOKEN = os.getenv("APP_TOKEN", "")
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "20"))
 CORS_ORIGINS = [
     o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()
 ] or ["*"]
 MAX_HISTORY = 12  # mensajes que se envían a la IA (ahorra cuota gratuita)
+
+PREFERRED_GROQ_CHAT_MODELS = (
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3-32b",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+)
+_NON_CHAT_MODEL_TOKENS = (
+    "whisper",
+    "guard",
+    "safeguard",
+    "tts",
+    "playai",
+    "embed",
+    "compound",
+    "orpheus",
+    "allam",
+)
+_resolved_ai_model: str | None = None
 
 # --- Personajes, niveles y escenarios --------------------------------------
 PERSONA_CATALOG = {
@@ -990,34 +1010,103 @@ def client_ip(request: Request) -> str:
 
 
 # --- Llamada a la IA --------------------------------------------------------
+async def _discover_chat_model(http: httpx.AsyncClient, exclude_model: str = "") -> str | None:
+    """Consulta `/models` en el proveedor y elige un modelo de chat activo compatible."""
+    try:
+        r = await http.get(
+            f"{AI_BASE_URL}/models",
+            headers={"Authorization": f"Bearer {AI_API_KEY}"},
+        )
+        if r.status_code >= 400:
+            return None
+        rows = (r.json() or {}).get("data") or []
+    except Exception:
+        return None
+
+    available: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("active") is False:
+            continue
+        mid = str(row.get("id") or "").strip()
+        if not mid or mid == exclude_model:
+            continue
+        low = mid.lower()
+        if any(tok in low for tok in _NON_CHAT_MODEL_TOKENS):
+            continue
+        available.append(mid)
+
+    for preferred in PREFERRED_GROQ_CHAT_MODELS:
+        if preferred in available:
+            return preferred
+    return available[0] if available else None
+
+
+def _build_ai_payload(model_name: str, system: str, messages: list[dict], max_tokens: int) -> dict:
+    low = model_name.lower()
+    is_reasoning = any(tag in low for tag in ("gpt-oss", "qwen3", "deepseek-r1"))
+    effective_max = max(max_tokens, 1400) if is_reasoning else max_tokens
+    payload: dict = {
+        "model": model_name,
+        "messages": [{"role": "system", "content": system}, *messages],
+        "temperature": 0.7,
+        "max_tokens": effective_max,
+    }
+    if "gpt-oss" in low and "groq.com" in AI_BASE_URL.lower():
+        payload["reasoning_effort"] = "low"
+    return payload
+
+
+def _extract_upstream_error(resp: httpx.Response) -> str:
+    try:
+        data = resp.json()
+        err = data.get("error")
+        msg = err.get("message") if isinstance(err, dict) else data.get("detail")
+        if msg:
+            return re.sub(r"\s+", " ", str(msg)).strip()[:160]
+    except Exception:
+        pass
+    return ""
+
+
 async def call_ai(
     http: httpx.AsyncClient,
     system: str,
     messages: list[dict],
     max_tokens: int = 500,
 ) -> str:
-    payload = {
-        "model": AI_MODEL,
-        "messages": [{"role": "system", "content": system}, *messages],
-        "temperature": 0.7,
-        "max_tokens": max_tokens,
-    }
-    try:
-        r = await http.post(
+    global _resolved_ai_model
+    model_name = _resolved_ai_model or AI_MODEL
+    headers = {"Authorization": f"Bearer {AI_API_KEY}"}
+
+    async def _post_completion(chosen_model: str) -> httpx.Response:
+        return await http.post(
             f"{AI_BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {AI_API_KEY}"},
-            json=payload,
+            headers=headers,
+            json=_build_ai_payload(chosen_model, system, messages, max_tokens),
         )
+
+    try:
+        r = await _post_completion(model_name)
+        if r.status_code == 404:
+            fallback_model = await _discover_chat_model(http, exclude_model=model_name)
+            if fallback_model:
+                _resolved_ai_model = fallback_model
+                model_name = fallback_model
+                r = await _post_completion(model_name)
     except httpx.HTTPError:
         raise HTTPException(502, "No pude contactar a la IA. Intenta de nuevo.")
+
     if r.status_code == 429:
         raise HTTPException(429, "Se alcanzó el límite gratuito de la IA. Prueba en un minuto.")
     if r.status_code >= 400:
-        raise HTTPException(502, f"La IA devolvió un error ({r.status_code}).")
+        hint = _extract_upstream_error(r)
+        suffix = f": {hint}" if hint else ""
+        raise HTTPException(502, f"La IA devolvió un error ({r.status_code}){suffix}.")
     try:
-        return r.json()["choices"][0]["message"]["content"] or ""
+        content = r.json()["choices"][0]["message"]["content"] or ""
     except (KeyError, IndexError, ValueError):
         raise HTTPException(502, "Respuesta inesperada de la IA.")
+    return re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
 
 
 def _extract_json_dict(raw: str) -> dict | None:
@@ -1173,6 +1262,7 @@ async def health():
     return {
         "ok": True,
         "ai_configured": bool(AI_API_KEY),
+        "ai_model": _resolved_ai_model or AI_MODEL,
         "version": "2.0",
         "edu_db_ready": True,
     }
