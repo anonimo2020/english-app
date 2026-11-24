@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: english-tutor-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      # Opción Groq (capa gratuita recomendada) · Para Gemini usa:
+      # AI_BASE_URL = https://generativelanguage.googleapis.com/v1beta/openai
+      # AI_MODEL = gemini-2.5-flash
+      - key: AI_BASE_URL
+        value: https://api.groq.com/openai/v1
+      - key: AI_MODEL
+        value: llama-3.3-70b-versatile
+      - key: RATE_LIMIT_PER_MIN
+        value: "30"
+      - key: EDU_RATE_LIMIT_PER_MIN
+        value: "120"
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: AI_API_KEY
+        sync: false   # pégala en el panel de Render, no en el repo
+      - key: APP_TOKEN
+        sync: false   # una cadena larga inventada por ti; la misma va en la app

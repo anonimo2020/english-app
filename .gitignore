@@ -1,0 +1,19 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+android-app/.gradle/
+android-app/build/
+android-app/app/build/
+android-app/local.properties
+android-app/.idea/
+android-app/.kotlin/
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/backups/
+*.apk
+*.bak
+files.zip
+Práctica de conversación con tutora virtual.png
